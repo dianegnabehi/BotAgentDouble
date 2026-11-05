@@ -1,6 +1,6 @@
 # BotAgentDouble
 
-Système automatisé de prospection d'emploi, d'alternance, stage Tech, IA et Data en approche directe : identification d'entreprises cibles, enrichissement des décideurs, génération de pitchs personnalisés validés sur Telegram et suivi automatique des relances. L'orchestration du projet est conteneurisée avec **Docker** et déployée en production sur une machine virtuelle **Google Cloud Platform (GCP)**.
+Système automatisé de prospection d'emploi, d'alternance, stage Tech, IA et Data en approche directe : identification d'entreprises cibles, enrichissement des décideurs, génération de pitchs personnalisés validés sur Telegram et suivi automatique des relances. L'orchestration du projet est conteneurisée avec **Docker** et déployée en production sur une machine virtuelle **Google Cloud Platform (GCP)**. Utilise le concept Human in the loop pour valider avant envoi.
 
 ---
 
