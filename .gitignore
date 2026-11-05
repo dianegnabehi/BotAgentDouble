@@ -1,0 +1,51 @@
+# Fichiers d'environnement et secrets (NE JAMAIS COMMITER)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+ENV/
+.pytest_cache/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Docker & Volumes locaux
+n8n_data/
+caddy_data/
+caddy_config/
+
+# macOS / OS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# IDE / Éditeurs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs & fichiers temporaires
+*.log
+tmp/
+temp/
+
+# Fichiers locaux, logs de suivi & déploiement GCP (exclus du dépôt public)
+README_LOCAL.md
+log.md
+AGENTS.md
+GUIDE_DEPLOIEMENT_VM_GCP.md
+setup_gcp_vm.sh
+docker-compose.yml
+Caddyfile
+.claude/

@@ -1,0 +1,1367 @@
+{
+  "name": "Prospection Alternance (Groq AI) : Enrichissement 2h + Validation Telegram + Relances J+7",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 2
+            }
+          ]
+        }
+      },
+      "id": "2a4f0000-0001-4000-8000-000000000001",
+      "name": "Schedule Trigger - Enrichissement (2h)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        200,
+        -240
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "prospection_alternance",
+        "limit": 10,
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "statut",
+              "condition": "eq",
+              "keyValue": "À enrichir"
+            }
+          ]
+        }
+      },
+      "id": "2a4f0000-0001-4000-8000-000000000002",
+      "name": "Supabase - Lire Entreprises A Enrichir",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        460,
+        -240
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst results = [];\nconst hunterApiKey = ($env.HUNTER_API_KEY || '').trim();\n\nasync function fetchUrl(url, asJson = false) {\n  try {\n    const controller = new AbortController();\n    const timer = setTimeout(() => controller.abort(), 6500);\n    const res = await fetch(url, {\n      headers: {\n        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',\n        'Accept': asJson ? 'application/json' : 'text/html,application/xhtml+xml,*/*;q=0.8',\n        'Accept-Language': 'fr-FR,fr;q=0.9,en;q=0.8'\n      },\n      signal: controller.signal\n    });\n    clearTimeout(timer);\n    if (!res.ok) return asJson ? null : '';\n    return asJson ? await res.json() : await res.text();\n  } catch (e) {\n    return asJson ? null : '';\n  }\n}\n\nfunction extractDomain(siteWeb) {\n  if (!siteWeb) return '';\n  try {\n    const normalized = siteWeb.startsWith('http') ? siteWeb : 'https://' + siteWeb;\n    return new URL(normalized).hostname.replace(/^www\\./i, '').toLowerCase();\n  } catch (e) {\n    return siteWeb.replace(/^https?:\\/\\/(www\\.)?/i, '').split('/')[0].toLowerCase();\n  }\n}\n\nfunction stripHtml(html) {\n  return (html || '')\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/g, ' ')\n    .replace(/&amp;/g, '&')\n    .replace(/&#x27;|&#39;/g, \"'\")\n    .replace(/&quot;/g, '\"')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\nfor (const item of items) {\n  const row = item.json;\n  const domain = extractDomain(row.site_web);\n  let hasMx = false;\n  let hunterPattern = '';\n  const hunterContacts = [];\n  const siteEmails = new Set();\n  const linkedinSnippets = [];\n  const siteSnippets = [];\n\n  if (domain && domain.includes('.')) {\n    // 1. Verification DNS MX du domaine\n    const dnsJson = await fetchUrl(`https://dns.google/resolve?name=${encodeURIComponent(domain)}&type=MX`, true);\n    hasMx = Array.isArray(dnsJson?.Answer) && dnsJson.Answer.length > 0;\n\n    // 2. Option B : Hunter.io Domain Search (si HUNTER_API_KEY est configure)\n    if (hunterApiKey && !hunterApiKey.startsWith('your-')) {\n      const hunterUrl = `https://api.hunter.io/v2/domain-search?domain=${encodeURIComponent(domain)}&api_key=${encodeURIComponent(hunterApiKey)}&limit=10`;\n      const hunterJson = await fetchUrl(hunterUrl, true);\n      if (hunterJson?.data) {\n        hunterPattern = hunterJson.data.pattern || '';\n        const emails = Array.isArray(hunterJson.data.emails) ? hunterJson.data.emails : [];\n        for (const c of emails) {\n          const fullName = [c.first_name, c.last_name].filter(Boolean).join(' ').trim();\n          if (c.value) {\n            hunterContacts.push({\n              nom: fullName,\n              poste: c.position || c.department || '',\n              email: c.value,\n              confidence: c.confidence || 0\n            });\n          }\n        }\n      }\n    }\n\n    // 3. Option A (Volet 1) : Recherche Web DuckDuckGo HTML des decideurs LinkedIn\n    const query = `site:linkedin.com/in \"${row.entreprise}\" (CTO OR \"Directeur Technique\" OR \"Head of AI\" OR \"VP Engineering\" OR \"Talent Acquisition\" OR DRH OR Fondateur)`;\n    const ddgHtml = await fetchUrl(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`);\n    if (ddgHtml) {\n      const titleRegex = /class=\"result__a\"[^>]*>([\\s\\S]*?)<\\/a>/gi;\n      let m;\n      while ((m = titleRegex.exec(ddgHtml)) !== null && linkedinSnippets.length < 6) {\n        const t = stripHtml(m[1]);\n        if (t) linkedinSnippets.push(t);\n      }\n      const snippetRegex = /class=\"result__snippet\"[^>]*>([\\s\\S]*?)<\\/a>/gi;\n      while ((m = snippetRegex.exec(ddgHtml)) !== null && linkedinSnippets.length < 10) {\n        const s = stripHtml(m[1]);\n        if (s) linkedinSnippets.push(s);\n      }\n    }\n\n    // 4. Option A (Volet 2) : Scraping des pages officielles de l'entreprise\n    const pagesToCheck = [\n      `https://${domain}`,\n      `https://${domain}/contact`,\n      `https://${domain}/mentions-legales`,\n      `https://${domain}/a-propos`\n    ];\n    const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}/g;\n    const ignoredPrefixes = ['noreply', 'no-reply', 'sentry', 'privacy', 'dpo', 'abuse', 'postmaster', 'webmaster', 'example', 'votrenom', 'prenom.nom'];\n\n    for (const pageUrl of pagesToCheck) {\n      const html = await fetchUrl(pageUrl);\n      if (!html) continue;\n      const found = html.match(emailRegex) || [];\n      for (const rawEmail of found) {\n        const e = rawEmail.toLowerCase();\n        const local = e.split('@')[0];\n        const emailDom = e.split('@')[1];\n        if (\n          !e.endsWith('.png') && !e.endsWith('.jpg') && !e.endsWith('.webp') && !e.endsWith('.svg') &&\n          !ignoredPrefixes.some(p => local.includes(p)) &&\n          (emailDom === domain || emailDom.endsWith('.' + domain))\n        ) {\n          siteEmails.add(e);\n        }\n      }\n      const cleanText = stripHtml(html);\n      const kwMatch = cleanText.match(/.{0,100}(Directeur|Pr[eé]sident|Fondateur|CTO|Head of|Recrutement|Talent|Contact).{0,140}/gi);\n      if (kwMatch) {\n        for (const snippet of kwMatch.slice(0, 3)) {\n          siteSnippets.push(snippet.trim());\n        }\n      }\n    }\n  }\n\n  results.push({\n    json: {\n      ...row,\n      domain,\n      has_mx: hasMx,\n      hunter_pattern: hunterPattern,\n      hunter_contacts: hunterContacts.slice(0, 5),\n      linkedin_snippets: linkedinSnippets.slice(0, 8),\n      site_emails: Array.from(siteEmails).slice(0, 6),\n      site_snippets: siteSnippets.slice(0, 5)\n    }\n  });\n}\n\nreturn results;"
+      },
+      "id": "2a4f0000-0001-4000-8000-000000000006",
+      "name": "Code - Collecter Web + Hunter + DNS MX",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        -240
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + ($env.GROQ_API_KEY || $env.MISTRAL_API_KEY) }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $env.GROQ_MODEL || 'qwen/qwen3.8-27b', temperature: 0.1, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: 'Tu es un expert en enrichissement B2B Tech en France. Tu analyses les données collectées (Hunter.io, résultats LinkedIn/Web, emails du site officiel et statut DNS MX) pour identifier un vrai décideur (Prénom Nom + Poste) et son adresse email professionnelle sur le domaine de l\\'entreprise. Réponds UNIQUEMENT en JSON valide.' }, { role: 'user', content: 'Entreprise : ' + $json.entreprise + ' (domaine: ' + $json.domain + ', DNS MX actif: ' + $json.has_mx + ', zone: ' + ($json.localisation || 'Paris') + ')\\nPoste recherché : ' + ($json.poste_contact || 'CTO, Head of AI, Directeur Technique, VP Engineering ou Talent Acquisition') + '\\n\\nDonnées Hunter.io : ' + JSON.stringify($json.hunter_contacts) + ' (pattern: ' + ($json.hunter_pattern || 'prenom.nom') + ')\\nRésultats Web / LinkedIn : ' + JSON.stringify($json.linkedin_snippets) + '\\nEmails trouvés sur le site : ' + JSON.stringify($json.site_emails) + '\\nExtraits du site : ' + JSON.stringify($json.site_snippets) + '\\n\\nRègles de décision :\\n1. Identifie le vrai Prénom et Nom du décideur le plus pertinent (Tech/IA/Data ou RH/Dirigeant) à partir des données Hunter, des extraits LinkedIn/Web ou de ta connaissance certaine de l\\'entreprise.\\n2. Pour email_contact : utilise en priorité l\\'email Hunter vérifié ou un email pertinent du site ; sinon, si tu as identifié le vrai Prénom + Nom d\\'un décideur chez ' + $json.entreprise + ' et que le domaine ' + $json.domain + ' est valide, construis son email professionnel nominatif en minuscules sans accent selon le pattern (' + ($json.hunter_pattern || 'prenom.nom') + '@' + $json.domain + ').\\n3. Réponds UNIQUEMENT avec cet objet JSON : {\"nom_contact\": \"Prénom Nom\", \"poste_contact\": \"Titre exact\", \"email_contact\": \"adresse@' + $json.domain + '\"}' }] }) }}",
+        "options": {}
+      },
+      "id": "2a4f0000-0001-4000-8000-000000000003",
+      "name": "Groq AI - Enrichir Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        920,
+        -240
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "function normalizeAscii(str) {\n  return (str || '')\n    .normalize('NFD')\n    .replace(/[\\u0300-\\u036f]/g, '')\n    .toLowerCase()\n    .replace(/[^a-z0-9.-]/g, '');\n}\n\nconst groqItems = $input.all();\nconst sourceItems = $('Code - Collecter Web + Hunter + DNS MX').all();\nconst validOutputs = [];\n\nfor (let i = 0; i < groqItems.length; i++) {\n  const rawText = (groqItems[i].json.choices?.[0]?.message?.content || '{}')\n    .replace(/<think>[\\s\\S]*?<\\/think>/g, '')\n    .replace(/```json|```/g, '')\n    .trim();\n  const src = sourceItems[i]?.json || {};\n  const domain = src.domain || '';\n\n  let parsed = {};\n  try {\n    const match = rawText.match(/\\{[\\s\\S]*\\}/);\n    parsed = JSON.parse(match ? match[0] : rawText);\n  } catch (e) {\n    parsed = {};\n  }\n\n  let nom = (parsed.nom_contact || '').trim();\n  let poste = (parsed.poste_contact || src.poste_contact || 'CTO / Responsable Tech').trim();\n  let email = (parsed.email_contact || '').trim().toLowerCase();\n\n  // Fallback 1 : Si Hunter.io a remonte un contact verifie\n  if ((!email || !nom) && Array.isArray(src.hunter_contacts) && src.hunter_contacts.length > 0) {\n    const bestHunter = src.hunter_contacts[0];\n    if (!nom && bestHunter.nom) nom = bestHunter.nom;\n    if (bestHunter.poste) poste = bestHunter.poste;\n    if (!email && bestHunter.email) email = bestHunter.email.toLowerCase();\n  }\n\n  // Fallback 2 : Si un vrai Prenom Nom est identifie et que le domaine a un MX actif, construire prenom.nom@domaine\n  const isRealPersonName = nom && nom.split(/\\s+/).length >= 2 && !/equipe|équipe|inconnu|non renseign|contact|recrutement|n\\/a/i.test(nom);\n  if (!email && isRealPersonName && domain && src.has_mx) {\n    const parts = nom.trim().split(/\\s+/);\n    const first = normalizeAscii(parts[0]);\n    const last = normalizeAscii(parts.slice(1).join(''));\n    if (first && last) {\n      email = `${first}.${last}@${domain}`;\n    }\n  }\n\n  // Fallback 3 : Email officiel trouve directement sur le site de l'entreprise\n  if (!email && Array.isArray(src.site_emails) && src.site_emails.length > 0) {\n    email = src.site_emails[0].toLowerCase();\n    if (!nom) nom = `Équipe Tech & Recrutement ${src.entreprise || ''}`.trim();\n  }\n\n  // Nettoyage des accents eventuels dans l'adresse email\n  if (email && email.includes('@')) {\n    const [localPart, domPart] = email.split('@');\n    email = `${normalizeAscii(localPart)}@${normalizeAscii(domPart)}`;\n  }\n\n  const isValidEmail =\n    /^[^\\s@]+@[^\\s@]+\\.[a-z]{2,}$/i.test(email) &&\n    !email.endsWith('@domaine.com') &&\n    !email.endsWith('@exemple.com') &&\n    !email.endsWith('@entreprise.com') &&\n    !email.startsWith('prenom.nom@');\n\n  // Filtre strict : on ne sauvegarde que si on a un nom et un email valide\n  if (!isValidEmail || !nom) {\n    continue;\n  }\n\n  validOutputs.push({\n    json: {\n      id: src.id,\n      nom_contact: nom,\n      poste_contact: poste,\n      email_contact: email\n    }\n  });\n}\n\nreturn validOutputs;"
+      },
+      "id": "2a4f0000-0001-4000-8000-000000000004",
+      "name": "Code - Filtrer Contacts Avec Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1160,
+        -240
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "prospection_alternance",
+        "matchType": "allFilters",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "id",
+              "condition": "eq",
+              "keyValue": "={{ $json.id }}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "nom_contact",
+              "fieldValue": "={{ $json.nom_contact }}"
+            },
+            {
+              "fieldId": "poste_contact",
+              "fieldValue": "={{ $json.poste_contact }}"
+            },
+            {
+              "fieldId": "email_contact",
+              "fieldValue": "={{ $json.email_contact }}"
+            },
+            {
+              "fieldId": "statut",
+              "fieldValue": "Enrichi"
+            }
+          ]
+        }
+      },
+      "id": "2a4f0000-0001-4000-8000-000000000005",
+      "name": "Supabase - Sauvegarder Contact Enrichi",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        1280,
+        -240
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "updates": [
+          "callback_query",
+          "message"
+        ],
+        "additionalFields": {}
+      },
+      "id": "1b3e9b10-0001-4000-8000-000000000001",
+      "name": "Telegram Webhook Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        340
+      ],
+      "webhookId": "telegram-pitch-review-webhook",
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_WITH_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram Bot Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.callback_query?.data }}",
+                    "rightValue": "approve:",
+                    "operator": {
+                      "type": "string",
+                      "operation": "startsWith"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Valider"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.callback_query?.data }}",
+                    "rightValue": "reject:",
+                    "operator": {
+                      "type": "string",
+                      "operation": "startsWith"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Refuser"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.callback_query?.data }}",
+                    "rightValue": "edit_ai:",
+                    "operator": {
+                      "type": "string",
+                      "operation": "startsWith"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Demande Edition IA"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.callback_query?.data }}",
+                    "rightValue": "edit_direct:",
+                    "operator": {
+                      "type": "string",
+                      "operation": "startsWith"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Demande Edition Texte"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.message?.text }}",
+                    "rightValue": "",
+                    "operator": {
+                      "type": "string",
+                      "operation": "notEmpty"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Reponse Texte Mobile"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "1b3e9b10-0001-4000-8000-000000000002",
+      "name": "Routeur Actions Telegram",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        460,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "tableId": "prospection_alternance",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "id",
+              "keyValue": "={{ $json.callback_query.data.split(':')[1] }}"
+            }
+          ]
+        }
+      },
+      "id": "1b3e9b10-0001-4000-8000-000000000003",
+      "name": "Supabase - Lire Prospect Valide",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        760,
+        60
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.email_contact }}",
+        "subject": "={{ 'Candidature Alternance Tech / IA — ' + $json.entreprise }}",
+        "emailType": "text",
+        "message": "={{ $json.pitch_genere }}",
+        "options": {}
+      },
+      "id": "1b3e9b10-0001-4000-8000-000000000014",
+      "name": "Gmail - Envoyer Candidature",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1020,
+        60
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_WITH_GMAIL_CREDENTIAL_ID",
+          "name": "Gmail Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "prospection_alternance",
+        "matchType": "allFilters",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "id",
+              "condition": "eq",
+              "keyValue": "={{ $('Supabase - Lire Prospect Valide').item.json.id }}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "statut",
+              "fieldValue": "Envoyé"
+            },
+            {
+              "fieldId": "date_envoi",
+              "fieldValue": "={{ $now.toISO() }}"
+            },
+            {
+              "fieldId": "nb_relances",
+              "fieldValue": "0"
+            },
+            {
+              "fieldId": "edit_mode",
+              "fieldValue": "={{ null }}"
+            }
+          ]
+        }
+      },
+      "id": "1b3e9b10-0001-4000-8000-000000000015",
+      "name": "Supabase - Marquer Envoye",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        1280,
+        60
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "prospection_alternance",
+        "matchType": "allFilters",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "id",
+              "condition": "eq",
+              "keyValue": "={{ $json.callback_query.data.split(':')[1] }}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "statut",
+              "fieldValue": "Refus"
+            },
+            {
+              "fieldId": "edit_mode",
+              "fieldValue": "={{ null }}"
+            }
+          ]
+        }
+      },
+      "id": "1b3e9b10-0001-4000-8000-000000000004",
+      "name": "Supabase - Marquer Refus",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        760,
+        220
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "prospection_alternance",
+        "matchType": "allFilters",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "id",
+              "condition": "eq",
+              "keyValue": "={{ $json.callback_query.data.split(':')[1] }}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "statut",
+              "fieldValue": "En cours d'édition"
+            },
+            {
+              "fieldId": "edit_mode",
+              "fieldValue": "ai"
+            }
+          ]
+        }
+      },
+      "id": "1b3e9b10-0001-4000-8000-000000000005",
+      "name": "Supabase - Mode Edition IA",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        760,
+        380
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "prospection_alternance",
+        "matchType": "allFilters",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "id",
+              "condition": "eq",
+              "keyValue": "={{ $json.callback_query.data.split(':')[1] }}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "statut",
+              "fieldValue": "En cours d'édition"
+            },
+            {
+              "fieldId": "edit_mode",
+              "fieldValue": "direct"
+            }
+          ]
+        }
+      },
+      "id": "1b3e9b10-0001-4000-8000-000000000006",
+      "name": "Supabase - Mode Edition Directe",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        760,
+        520
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_ADMIN_CHAT_ID }}",
+        "text": "={{ '✅ Email envoyé à ' + $json.nom_contact + ' (' + $json.email_contact + ') chez ' + $json.entreprise + ' !\\n📌 Statut : Envoyé (Relance auto J+7 programmée).' }}",
+        "additionalFields": {}
+      },
+      "id": "1b3e9b10-0001-4000-8000-000000000007",
+      "name": "Telegram - Confirmer Envoi Email",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1540,
+        60
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_WITH_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram Bot Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_ADMIN_CHAT_ID }}",
+        "text": "={{ '🤖 Envoie ta consigne de modification pour ' + ($json.nom_contact || 'le contact') + ' chez ' + $json.entreprise + ' (ex: plus court, tutoie-le, parle de mes projets Python) :' }}",
+        "additionalFields": {}
+      },
+      "id": "1b3e9b10-0001-4000-8000-000000000008",
+      "name": "Telegram - Demander Consigne IA",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1020,
+        380
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_WITH_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram Bot Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_ADMIN_CHAT_ID }}",
+        "text": "={{ '✏️ Envoie directement le nouveau texte complet du pitch pour ' + $json.entreprise + ' :' }}",
+        "additionalFields": {}
+      },
+      "id": "1b3e9b10-0001-4000-8000-000000000009",
+      "name": "Telegram - Demander Texte Direct",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1020,
+        520
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_WITH_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram Bot Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "prospection_alternance",
+        "limit": 1,
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "statut",
+              "condition": "eq",
+              "keyValue": "En cours d'édition"
+            }
+          ]
+        }
+      },
+      "id": "1b3e9b10-0001-4000-8000-000000000010",
+      "name": "Supabase - Chercher Pitch en Edition",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        760,
+        700
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + ($env.GROQ_API_KEY || $env.MISTRAL_API_KEY) }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $env.GROQ_MODEL || 'qwen/qwen3.8-27b', temperature: 0.25, messages: [{ role: 'system', content: 'Tu es un ingénieur / candidat français en alternance Tech, IA & Data au style rédactionnel irréprochable. Rédige exclusivement dans un français professionnel, fluide et sans aucune faute d\\'orthographe ni d\\'accord. N\\'utilise JAMAIS de mots espagnols, portugais ou inventés (ex: jamais foco ni idéeaux). Réponds uniquement avec le corps de l\\'email.' }, { role: 'user', content: $json.edit_mode === 'direct' ? 'Retourne exactement ce texte sans rien modifier : ' + $('Telegram Webhook Trigger').item.json.message.text : 'Voici le pitch actuel pour ' + ($json.nom_contact || 'le décideur') + ' (' + ($json.poste_contact || '') + ') chez ' + $json.entreprise + ' :\\n' + $json.pitch_genere + '\\n\\nRéécris ce pitch en français irréprochable (sans commentaire autour) en appliquant strictement cette consigne : ' + $('Telegram Webhook Trigger').item.json.message.text }] }) }}",
+        "options": {}
+      },
+      "id": "1b3e9b10-0001-4000-8000-000000000011",
+      "name": "Groq AI - Reecrire Pitch",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1020,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "prospection_alternance",
+        "matchType": "allFilters",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "id",
+              "condition": "eq",
+              "keyValue": "={{ $('Supabase - Chercher Pitch en Edition').item.json.id }}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "pitch_genere",
+              "fieldValue": "={{ $json.choices[0].message.content.replace(/<think>[\\s\\S]*?<\\/think>/g, '').replace(/\\bfoco\\b/gi, 'focus').replace(/\\bidéeaux\\b/gi, 'idéaux').trim() }}"
+            },
+            {
+              "fieldId": "statut",
+              "fieldValue": "En attente de validation"
+            },
+            {
+              "fieldId": "edit_mode",
+              "fieldValue": "={{ null }}"
+            }
+          ]
+        }
+      },
+      "id": "1b3e9b10-0001-4000-8000-000000000012",
+      "name": "Supabase - Sauvegarder Nouveau Pitch",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        1280,
+        700
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_ADMIN_CHAT_ID }}",
+        "text": "={{ '🎯 Pitch mis à jour\\n\\n🏢 Entreprise : ' + $json.entreprise + ' (' + ($json.localisation || 'IDF') + ')\\n👤 Contact : ' + ($json.nom_contact || 'N/A') + ' (' + ($json.poste_contact || 'N/A') + ')\\n📧 Email : ' + ($json.email_contact || 'N/A') + '\\n\\n💬 Nouvelle version :\\n--------------------\\n' + $json.pitch_genere + '\\n--------------------' }}",
+        "replyMarkup": "inlineKeyboard",
+        "inlineKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "✅ Valider & Envoyer Email",
+                    "additionalFields": {
+                      "callback_data": "={{ 'approve:' + $json.id }}"
+                    }
+                  },
+                  {
+                    "text": "❌ Refuser",
+                    "additionalFields": {
+                      "callback_data": "={{ 'reject:' + $json.id }}"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "✏️ Éditer (texte)",
+                    "additionalFields": {
+                      "callback_data": "={{ 'edit_direct:' + $json.id }}"
+                    }
+                  },
+                  {
+                    "text": "🤖 Éditer via IA",
+                    "additionalFields": {
+                      "callback_data": "={{ 'edit_ai:' + $json.id }}"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "additionalFields": {}
+      },
+      "id": "1b3e9b10-0001-4000-8000-000000000013",
+      "name": "Telegram - Renvoyer Carte Validation",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1540,
+        700
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_WITH_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram Bot Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "id": "3c7f0000-0001-4000-8000-000000000001",
+      "name": "Schedule Trigger - Suivi Relances J+7",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        200,
+        1060
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "prospection_alternance",
+        "returnAll": true,
+        "matchType": "anyFilter",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "statut",
+              "condition": "eq",
+              "keyValue": "Envoyé"
+            },
+            {
+              "keyName": "statut",
+              "condition": "eq",
+              "keyValue": "Relancé"
+            }
+          ]
+        }
+      },
+      "id": "3c7f0000-0001-4000-8000-000000000002",
+      "name": "Supabase - Lire Contacts En Attente de Retour",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        460,
+        1060
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const now = Date.now();\nconst SEPT_JOURS_MS = 7 * 24 * 60 * 60 * 1000;\nconst results = [];\n\nfor (const item of $input.all()) {\n  const row = item.json;\n  if (!['Envoyé', 'Relancé'].includes(row.statut)) continue;\n\n  const refDateStr = row.date_derniere_relance || row.date_envoi;\n  if (!refDateStr) continue;\n\n  const refTime = new Date(refDateStr).getTime();\n  const elapsedMs = now - refTime;\n\n  if (elapsedMs >= SEPT_JOURS_MS) {\n    const nbRelances = Number(row.nb_relances || 0);\n    results.push({\n      json: {\n        ...row,\n        nb_relances: nbRelances,\n        prochain_num_relance: nbRelances + 1,\n        action_j7: nbRelances < 2 ? 'relancer' : 'cloturer_refus'\n      }\n    });\n  }\n}\n\nreturn results;"
+      },
+      "id": "3c7f0000-0001-4000-8000-000000000003",
+      "name": "Code - Filtrer Echeances J+7",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        740,
+        1060
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action_j7 }}",
+                    "rightValue": "relancer",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Relancer (nb_relances < 2)"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action_j7 }}",
+                    "rightValue": "cloturer_refus",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Cloturer Refus (apres 2 relances)"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "3c7f0000-0001-4000-8000-000000000004",
+      "name": "Routeur J+7 : Relance ou Cloture",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        1000,
+        1060
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + ($env.GROQ_API_KEY || $env.MISTRAL_API_KEY) }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $env.GROQ_MODEL || 'qwen/qwen3.8-27b', temperature: 0.25, messages: [{ role: 'system', content: 'Tu es un candidat français en alternance Tech, IA & Data au style rédactionnel irréprochable. Rédige exclusivement dans un français professionnel, sobre, fluide et sans aucune faute d\\'orthographe. Réponds uniquement avec le corps du message.' }, { role: 'user', content: 'Rédige un email de relance #' + $json.prochain_num_relance + ' (sur 2 maximum) à J+7, très court (60 mots max), courtois et percutant pour ' + ($json.nom_contact || 'le décideur') + ' (' + ($json.poste_contact || '') + ') chez ' + $json.entreprise + '.\\nVoici le message initial envoyé :\\n' + $json.pitch_genere + '\\n\\nRéponds uniquement avec le corps du message de relance.' }] }) }}",
+        "options": {}
+      },
+      "id": "3c7f0000-0001-4000-8000-000000000005",
+      "name": "Groq AI - Rediger Relance J+7",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1280,
+        960
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('Routeur J+7 : Relance ou Cloture').item.json.email_contact }}",
+        "subject": "={{ 'Re: Candidature Alternance Tech / IA — ' + $('Routeur J+7 : Relance ou Cloture').item.json.entreprise }}",
+        "emailType": "text",
+        "message": "={{ $json.choices[0].message.content.replace(/<think>[\\s\\S]*?<\\/think>/g, '').trim() }}",
+        "options": {}
+      },
+      "id": "3c7f0000-0001-4000-8000-000000000006",
+      "name": "Gmail - Envoyer Relance J+7",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1540,
+        960
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_WITH_GMAIL_CREDENTIAL_ID",
+          "name": "Gmail Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "prospection_alternance",
+        "matchType": "allFilters",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "id",
+              "condition": "eq",
+              "keyValue": "={{ $('Routeur J+7 : Relance ou Cloture').item.json.id }}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "statut",
+              "fieldValue": "Relancé"
+            },
+            {
+              "fieldId": "nb_relances",
+              "fieldValue": "={{ $('Routeur J+7 : Relance ou Cloture').item.json.prochain_num_relance }}"
+            },
+            {
+              "fieldId": "date_derniere_relance",
+              "fieldValue": "={{ $now.toISO() }}"
+            },
+            {
+              "fieldId": "dernier_message_relance",
+              "fieldValue": "={{ $('Groq AI - Rediger Relance J+7').item.json.choices[0].message.content.replace(/<think>[\\s\\S]*?<\\/think>/g, '').trim() }}"
+            }
+          ]
+        }
+      },
+      "id": "3c7f0000-0001-4000-8000-000000000007",
+      "name": "Supabase - Enregistrer Relance",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        1800,
+        960
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_ADMIN_CHAT_ID }}",
+        "text": "={{ '🔄 Relance automatique J+7 (#' + $json.nb_relances + '/2) envoyée à ' + $json.nom_contact + ' chez ' + $json.entreprise + ' (' + $json.email_contact + ').' }}",
+        "additionalFields": {}
+      },
+      "id": "3c7f0000-0001-4000-8000-000000000008",
+      "name": "Telegram - Notifier Relance J+7",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2060,
+        960
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_WITH_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram Bot Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "prospection_alternance",
+        "matchType": "allFilters",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "id",
+              "condition": "eq",
+              "keyValue": "={{ $json.id }}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "statut",
+              "fieldValue": "Refus"
+            }
+          ]
+        }
+      },
+      "id": "3c7f0000-0001-4000-8000-000000000009",
+      "name": "Supabase - Cloturer Contact a Refus",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        1280,
+        1180
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_ADMIN_CHAT_ID }}",
+        "text": "={{ '🛑 Clôture automatique à Refus : Sans retour à J+7 après 2 relances, le contact ' + $json.nom_contact + ' chez ' + $json.entreprise + ' a été clôturé au statut Refus.' }}",
+        "additionalFields": {}
+      },
+      "id": "3c7f0000-0001-4000-8000-000000000010",
+      "name": "Telegram - Notifier Cloture Refus",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1540,
+        1180
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_WITH_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram Bot Account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger - Enrichissement (2h)": {
+      "main": [
+        [
+          {
+            "node": "Supabase - Lire Entreprises A Enrichir",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase - Lire Entreprises A Enrichir": {
+      "main": [
+        [
+          {
+            "node": "Code - Collecter Web + Hunter + DNS MX",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Collecter Web + Hunter + DNS MX": {
+      "main": [
+        [
+          {
+            "node": "Groq AI - Enrichir Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq AI - Enrichir Contact": {
+      "main": [
+        [
+          {
+            "node": "Code - Filtrer Contacts Avec Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Filtrer Contacts Avec Email": {
+      "main": [
+        [
+          {
+            "node": "Supabase - Sauvegarder Contact Enrichi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Routeur Actions Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Routeur Actions Telegram": {
+      "main": [
+        [
+          {
+            "node": "Supabase - Lire Prospect Valide",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Supabase - Marquer Refus",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Supabase - Mode Edition IA",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Supabase - Mode Edition Directe",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Supabase - Chercher Pitch en Edition",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase - Lire Prospect Valide": {
+      "main": [
+        [
+          {
+            "node": "Gmail - Envoyer Candidature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail - Envoyer Candidature": {
+      "main": [
+        [
+          {
+            "node": "Supabase - Marquer Envoye",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase - Marquer Envoye": {
+      "main": [
+        [
+          {
+            "node": "Telegram - Confirmer Envoi Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase - Mode Edition IA": {
+      "main": [
+        [
+          {
+            "node": "Telegram - Demander Consigne IA",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase - Mode Edition Directe": {
+      "main": [
+        [
+          {
+            "node": "Telegram - Demander Texte Direct",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase - Chercher Pitch en Edition": {
+      "main": [
+        [
+          {
+            "node": "Groq AI - Reecrire Pitch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq AI - Reecrire Pitch": {
+      "main": [
+        [
+          {
+            "node": "Supabase - Sauvegarder Nouveau Pitch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase - Sauvegarder Nouveau Pitch": {
+      "main": [
+        [
+          {
+            "node": "Telegram - Renvoyer Carte Validation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger - Suivi Relances J+7": {
+      "main": [
+        [
+          {
+            "node": "Supabase - Lire Contacts En Attente de Retour",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase - Lire Contacts En Attente de Retour": {
+      "main": [
+        [
+          {
+            "node": "Code - Filtrer Echeances J+7",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Filtrer Echeances J+7": {
+      "main": [
+        [
+          {
+            "node": "Routeur J+7 : Relance ou Cloture",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Routeur J+7 : Relance ou Cloture": {
+      "main": [
+        [
+          {
+            "node": "Groq AI - Rediger Relance J+7",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Supabase - Cloturer Contact a Refus",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq AI - Rediger Relance J+7": {
+      "main": [
+        [
+          {
+            "node": "Gmail - Envoyer Relance J+7",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail - Envoyer Relance J+7": {
+      "main": [
+        [
+          {
+            "node": "Supabase - Enregistrer Relance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase - Enregistrer Relance": {
+      "main": [
+        [
+          {
+            "node": "Telegram - Notifier Relance J+7",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase - Cloturer Contact a Refus": {
+      "main": [
+        [
+          {
+            "node": "Telegram - Notifier Cloture Refus",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
